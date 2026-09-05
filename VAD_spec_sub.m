@@ -12,12 +12,18 @@ clear; clc; close all;
 %% -------------------------------------------------------------------------
 %  1. AUDIO IMPORT
 % -------------------------------------------------------------------------
-[x,  fs]       = audioread('1.wav');
-[clean, fs_cl] = audioread('1_clean.wav');
+%[x,  fs]       = audioread('1.wav');
+[x,  fs]       = audioread('sp01_car_sn15.wav');
+%[clean, fs_cl] = audioread('1_clean.wav');
+[clean, fs_cl] = audioread('sp01.wav');
 
 % Ensure mono column vectors
 x     = mean(x,     2);
 clean = mean(clean, 2);
+
+if fs ~= fs_cl
+    clean = resample(clean, fs, fs_cl);
+end
 
 % Resample to 8 kHz to match paper conditions
 target_fs = 8000;
@@ -197,10 +203,11 @@ title('VAD Threshold Visualisation'); grid on;
 
 % -- 8b. VAD overlay on clean speech --
 VAD_sig = vad_to_signal(VAD, frame_length, hop, length(x));
-t = (0:length(x)-1) / fs;
+t_plot = min([length(x), length(clean), length(VAD_sig)]);
+t = (0:t_plot-1) / fs;
 figure('Name','VAD on Clean Speech');
-plot(t, clean(1:length(x))/max(abs(clean)), 'b'); hold on;
-plot(t, VAD_sig(1:length(x)) * 0.9, 'r', 'LineWidth', 1.2);
+plot(t, clean(1:t_plot)/max(abs(clean(1:t_plot))+eps), 'b'); hold on;
+plot(t, VAD_sig(1:t_plot) * 0.9, 'r', 'LineWidth', 1.2);
 legend('Clean Speech (normalised)','VAD');
 xlabel('Time (s)'); ylabel('Amplitude');
 title('VAD Overlay on Clean Speech'); grid on;
@@ -254,7 +261,6 @@ end
 function sig = reconstruct_signal(mag, phase, win_len, hop, out_len)
 % Overlap-add IFFT reconstruction from one-sided mag + phase.
     T   = size(mag, 2);
-    F   = size(mag, 1);
     win = hamming(win_len);
 
     % Reconstruct full (two-sided) spectrum
@@ -299,6 +305,9 @@ function VAD_sig = vad_to_signal(VAD, win_len, hop, out_len)
     cnt     = max(cnt, 1);
     VAD_sig = VAD_sig ./ cnt >= 0.5;   % majority vote across overlapping frames
     VAD_sig = double(VAD_sig(1:min(out_len, end)));
+    if length(VAD_sig) < out_len
+        VAD_sig = [VAD_sig; zeros(out_len - length(VAD_sig), 1)];
+    end
 end
 
 % -------------------------------------------------------------------------
