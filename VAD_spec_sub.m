@@ -1,8 +1,12 @@
 % =========================================================================
-% Spectral Subtraction with VAD-guided Noise Estimation
-% Based on: Faneuff & Brown, ISPC 2003
+% Spectral Subtraction with MCRA-guided Noise Estimation
+% Based on: Faneuff & Brown, ISPC 2003 (spectral subtraction framework)
 %           Boll (1979) spectral subtraction
 %           Johnston (1988) perceptual weighting (threshold floor only here)
+%           Cohen & Berdugo, "Speech enhancement for non-stationary noise
+%             environments," Signal Processing 81 (2001) 2403-2418 (MCRA
+%             noise PSD tracking — replaces the fixed-threshold VAD-gated
+%             noise estimator formerly used here)
 %
 % Authors: Sydney Corum + integration
 % =========================================================================
@@ -12,12 +16,18 @@ clear; clc; close all;
 %% -------------------------------------------------------------------------
 %  1. AUDIO IMPORT
 % -------------------------------------------------------------------------
-[x,  fs]       = audioread('1.wav');
-[clean, fs_cl] = audioread('1_clean.wav');
+%[x,  fs]       = audioread('1.wav');
+[x,  fs]       = audioread('sp01_car_sn5.wav');
+%[clean, fs_cl] = audioread('1_clean.wav');
+[clean, fs_cl] = audioread('sp01.wav');
 
 % Ensure mono column vectors
 x     = mean(x,     2);
 clean = mean(clean, 2);
+
+if fs ~= fs_cl
+    clean = resample(clean, fs, fs_cl);
+end
 
 % Resample to 8 kHz to match paper conditions
 target_fs = 8000;
@@ -37,13 +47,28 @@ frame_length = round(fs * win_dur_s);   % = 128 samples
 overlap_frac = 0.5;
 hop          = round(frame_length * (1 - overlap_frac));   % 50% overlap hop
 
-% --- VAD ---
-alpha   = 0.95;   % Noise spectrum smoothing  (Eq. 2.4, Virag value)
-beta    = 0.95;   % Mean/variance smoothing   (Eq. 2.6-2.7, Virag value)
-alpha_s = 3.5;    % Speech threshold multiplier  (tune experimentally)
-alpha_n = 2.2;    % Noise threshold multiplier
+% --- MCRA Noise PSD Tracking (Cohen & Berdugo, 2001) ---
+freq_smooth_halfwidth = 1;    % bins each side for periodogram frequency smoothing
+alpha_s_mcra  = 0.8;          % periodogram temporal smoothing        (Eq. 3)
+alpha_d_mcra  = 0.95;         % base noise-PSD smoothing constant     (Eq. 9)
+alpha_p_mcra  = 0.2;          % speech-presence probability smoothing (Eq. 7)
+delta_mcra    = 5;            % Sr threshold for presence indicator   (tune 2-5 per noise type)
+min_win_dur_s = 1.6;          % minima-search window duration (s) — minima tracking horizon
+gamma_md      = 0.998;        % minima-tracker smoothing constant
+beta_md       = 0.8;          % minima-tracker bias-compensation constant
 
-n_init  = 10;     % Frames assumed noise-only for initialisation (paper Section 2)
+% --- Broadband VAD (diagnostics + hangover only — noise tracking above ---
+% --- no longer depends on a hard decision, so it can't be mis-fed back) ---
+p_thresh   = 0.2;    % mean speech-presence probability above which frame = speech
+                      % (NOTE: this averages a per-bin binary decision across
+                      % all F bins, and speech rarely lights up every bin at
+                      % once, so 0.2-0.3 is typically "active" here, not 0.5 —
+                      % re-check against your own p_avg distribution if you
+                      % change the frame size or noise type)
+hang_dur_s = 0.15;   % hangover duration (s): hold "speech" through weak trailing frames
+
+L_min       = max(1, round(min_win_dur_s / (hop / fs)));   % minima window, in frames
+hang_frames = round(hang_dur_s / (hop / fs));              % hangover, in frames
 
 % --- Spectral Subtraction ---
 over_sub    = 1.5;   % Over-subtraction factor (a in paper Fig 3-1)
@@ -65,99 +90,51 @@ fprintf('Frames       : %d\n', N_frames);
 fprintf('Freq bins    : %d\n', F);
 
 %% -------------------------------------------------------------------------
-%  4. VAD  (Section 2 of paper)
+%  4. NOISE PSD TRACKING + VAD  (MCRA — Cohen & Berdugo, 2001)
 % -------------------------------------------------------------------------
-% Work in LOG domain throughout for numerical stability.
-% All energy/threshold quantities are log-power.
+% Noise PSD is tracked continuously per frequency bin via a smoothed,
+% minima-tracked speech-presence probability — no hard VAD gate is needed
+% to decide when to update it, so a wrong broadband decision can no longer
+% stall the estimate or contaminate it with speech energy (the failure
+% mode of the old fixed-threshold, VAD-gated estimator).
+X_pow = X_mag.^2;   % [F x T] noisy periodogram
 
+[lambda_d, p_avg] = mcra_noise_estimate(X_pow, freq_smooth_halfwidth, ...
+    alpha_s_mcra, alpha_d_mcra, alpha_p_mcra, delta_mcra, L_min, gamma_md, beta_md);
+
+% Broadband hard VAD — derived only for diagnostics/plots and for the
+% hangover below; it plays no role in the noise estimate above.
 VAD = zeros(N_frames, 1);
-
-% -- Initialise from first frame (Eq. 2.2) --
-N_spec  = abs(X_mag(:, 1)).^2;          % noise power estimate [F x 1]
-mu_N    = log(mean(N_spec) + eps);      % log-mean of noise power
-sigma_N = std(log(N_spec  + eps));      % log-std  of noise power
-
-% Diagnostic logs
-frame_energy_log  = zeros(1, N_frames);
-speech_thres_log  = zeros(1, N_frames);
-noise_thres_log   = zeros(1, N_frames);
-
+hang_ctr = 0;
 for k = 1:N_frames
-
-    % --- Current frame power & log-energy ---
-    frame_pow  = X_mag(:, k).^2;                   % [F x 1]
-    frame_logE = log(mean(frame_pow) + eps);        % scalar log-energy
-
-    % --- Thresholds (Eq. 2.8 - 2.9) ---
-    speech_thres = mu_N + alpha_s * sigma_N;
-    noise_thres  = mu_N + alpha_n * sigma_N;
-
-    frame_energy_log(k) = frame_logE;
-    speech_thres_log(k) = speech_thres;
-    noise_thres_log(k)  = noise_thres;
-
-    % --- VAD decision ---
-    if k <= n_init
-        % Paper: first 10 frames assumed noise (Section 2)
-        VAD(k) = 0;
-    elseif frame_logE > speech_thres
-        VAD(k) = 1;
-    elseif frame_logE < noise_thres
-        VAD(k) = 0;
+    if p_avg(k) > p_thresh
+        VAD(k)   = 1;
+        hang_ctr = hang_frames;
+    elseif hang_ctr > 0
+        VAD(k)   = 1;
+        hang_ctr = hang_ctr - 1;
     else
-        % Ambiguous: carry forward previous decision
-        if k > 1
-            VAD(k) = VAD(k-1);
-        end
-    end
-
-    % --- Noise estimator update — only when NO speech (Eq. 2.4 - 2.7) ---
-    if VAD(k) == 0
-        % Eq. 2.4: update noise power spectrum
-        N_spec = alpha * N_spec + (1 - alpha) * frame_pow;
-
-        % Eq. 2.5: instantaneous log-mean of updated estimate
-        mu_inst = log(mean(N_spec) + eps);
-
-        % Cache old mean BEFORE updating (needed for variance, Eq. 2.7)
-        mu_N_old = mu_N;
-
-        % Eq. 2.6: smooth the mean
-        mu_N = beta * mu_N + (1 - beta) * mu_inst;
-
-        % Eq. 2.7: smooth the variance (use OLD mean to compute deviation)
-        sigma_N = sqrt(beta * sigma_N^2 + (1 - beta) * (mu_inst - mu_N_old)^2);
-        sigma_N = max(sigma_N, 1e-6);   % guard against collapse to zero
+        VAD(k) = 0;
     end
 end
+
+% Diagnostic logs
+frame_energy_log = log(mean(X_pow,    1) + eps);   % broadband log-energy per frame
+noise_floor_log  = log(mean(lambda_d, 1) + eps);   % tracked adaptive noise floor
+speech_prob_log  = p_avg;                          % mean speech-presence probability
 
 fprintf('\nVAD: %d speech frames / %d total (%.0f%%)\n', ...
     sum(VAD), N_frames, 100*mean(VAD));
 
 %% -------------------------------------------------------------------------
 %  5. SPECTRAL SUBTRACTION  (Section 3.1 of paper)
-%     S_hat(w,k) = max( |M|^2 - a*|N|^2 , b*|N|^2 )
+%     S_hat(w,k) = max( |M|^2 - a*lambda_d(w,k) , b*lambda_d(w,k) )
+%     Noise PSD is the per-bin, per-frame MCRA estimate from Section 4.
 %     Phase from noisy signal (Wang & Lim justification)
 % -------------------------------------------------------------------------
-S_mag = zeros(F, N_frames);
-
-% Re-run noise estimator to get per-frame N_spec for subtraction
-% (reset to same initial condition used in VAD pass)
-N_spec_ss = abs(X_mag(:, 1)).^2;
-
-for k = 1:N_frames
-    frame_pow = X_mag(:, k).^2;
-
-    % Subtraction with spectral floor
-    sub   = frame_pow - over_sub * N_spec_ss;
-    floor = noise_floor * N_spec_ss;
-    S_mag(:, k) = sqrt(max(sub, floor));   % back to magnitude
-
-    % Update noise estimate only on noise frames
-    if VAD(k) == 0
-        N_spec_ss = alpha * N_spec_ss + (1 - alpha) * frame_pow;
-    end
-end
+sub   = X_pow - over_sub * lambda_d;
+floor = noise_floor * lambda_d;
+S_mag = sqrt(max(sub, floor));   % back to magnitude, [F x N_frames]
 
 %% -------------------------------------------------------------------------
 %  6. RECONSTRUCT TIME-DOMAIN SIGNAL  (IFFT + overlap-add)
@@ -185,22 +162,29 @@ fprintf('%-25s %10.2f %10.2f\n', 'Seg-SNR (dB)',      metrics_noisy.SSNR, metric
 %  8. PLOTS
 % -------------------------------------------------------------------------
 
-% -- 8a. VAD threshold visualisation --
-figure('Name','VAD Thresholds');
+% -- 8a. Adaptive noise floor & VAD visualisation --
+figure('Name','Noise Floor & VAD');
+subplot(2,1,1);
 plot(frame_energy_log, 'b',  'LineWidth', 1.5); hold on;
-plot(speech_thres_log, 'r--','LineWidth', 1.5);
-plot(noise_thres_log,  'g--','LineWidth', 1.5);
-stairs(VAD * max(frame_energy_log), 'k', 'LineWidth', 2);
-legend('Frame Log-Energy','Speech Threshold','Noise Threshold','VAD (scaled)');
+plot(noise_floor_log,  'g--','LineWidth', 1.5);
+stairs(VAD * max(frame_energy_log), 'k', 'LineWidth', 1.5);
+legend('Frame Log-Energy','Adaptive Noise Floor (MCRA)','VAD (scaled)');
 xlabel('Frame Index'); ylabel('Log Energy');
-title('VAD Threshold Visualisation'); grid on;
+title('Adaptive Noise Floor Tracking'); grid on;
+
+subplot(2,1,2);
+plot(speech_prob_log, 'm', 'LineWidth', 1.5); hold on;
+plot([1 N_frames], [p_thresh p_thresh], 'k--');
+xlabel('Frame Index'); ylabel('Speech-presence probability');
+title('MCRA Mean Speech-Presence Probability'); grid on; ylim([0 1]);
 
 % -- 8b. VAD overlay on clean speech --
 VAD_sig = vad_to_signal(VAD, frame_length, hop, length(x));
-t = (0:length(x)-1) / fs;
+t_plot = min([length(x), length(clean), length(VAD_sig)]);
+t = (0:t_plot-1) / fs;
 figure('Name','VAD on Clean Speech');
-plot(t, clean(1:length(x))/max(abs(clean)), 'b'); hold on;
-plot(t, VAD_sig(1:length(x)) * 0.9, 'r', 'LineWidth', 1.2);
+plot(t, clean(1:t_plot)/max(abs(clean(1:t_plot))+eps), 'b'); hold on;
+plot(t, VAD_sig(1:t_plot) * 0.9, 'r', 'LineWidth', 1.2);
 legend('Clean Speech (normalised)','VAD');
 xlabel('Time (s)'); ylabel('Amplitude');
 title('VAD Overlay on Clean Speech'); grid on;
@@ -254,7 +238,6 @@ end
 function sig = reconstruct_signal(mag, phase, win_len, hop, out_len)
 % Overlap-add IFFT reconstruction from one-sided mag + phase.
     T   = size(mag, 2);
-    F   = size(mag, 1);
     win = hamming(win_len);
 
     % Reconstruct full (two-sided) spectrum
@@ -283,6 +266,70 @@ function sig = reconstruct_signal(mag, phase, win_len, hop, out_len)
 end
 
 % -------------------------------------------------------------------------
+function [lambda_d, p_avg] = mcra_noise_estimate(X_pow, hw, alpha_s, alpha_d, ...
+    alpha_p, delta, L, gamma_md, beta_md)
+% MCRA noise PSD tracking (Cohen & Berdugo, Signal Processing 81 (2001)
+% 2403-2418). Tracks a per-bin noise PSD estimate lambda_d [F x T] from the
+% noisy periodogram X_pow [F x T], using a minima-controlled, recursively
+% smoothed speech-presence probability instead of a hard VAD gate. Also
+% returns p_avg [1 x T], the frequency-averaged speech-presence probability
+% (for a diagnostic broadband VAD only — it is not fed back into lambda_d).
+    [F, T] = size(X_pow);
+
+    win = hanning(2*hw + 1); win = win / sum(win);   % frequency smoothing window
+
+    S        = zeros(F, T);
+    S_min    = zeros(F, T);
+    S_tmp    = zeros(F, T);
+    p        = zeros(F, T);
+    lambda_d = zeros(F, T);
+
+    for l = 1:T
+        Sf = conv(X_pow(:, l), win, 'same');   % Eq. 3: smooth over frequency
+
+        if l == 1
+            S(:, l)        = Sf;
+            S_min(:, l)    = Sf;
+            S_tmp(:, l)    = Sf;
+            lambda_d(:, l) = X_pow(:, l);       % initialise from first frame
+            continue;
+        end
+
+        S(:, l) = alpha_s * S(:, l-1) + (1 - alpha_s) * Sf;   % Eq. 3: smooth over time
+
+        % Minima tracking, dual-buffer (Doblinger-style) — Eq. 4-5
+        below = S(:, l) < S_min(:, l-1);
+        Smin_new = zeros(F, 1);
+        Stmp_new = zeros(F, 1);
+        Smin_new(below) = S(below, l);
+        Stmp_new(below) = S(below, l);
+        Smin_new(~below) = gamma_md * S_min(~below, l-1) + ...
+            ((1 - gamma_md) / (1 - beta_md)) * (S(~below, l) - beta_md * S(~below, l-1));
+        Stmp_new(~below) = min(S_tmp(~below, l-1), S(~below, l));
+
+        if mod(l, L) == 0
+            % Periodic buffer swap: refresh the running minimum from the
+            % window just completed instead of letting it drift forever.
+            Smin_new = min(S_tmp(:, l-1), S(:, l));
+            Stmp_new = S(:, l);
+        end
+        S_min(:, l) = Smin_new;
+        S_tmp(:, l) = Stmp_new;
+
+        % Speech-presence indicator + probability smoothing — Eq. 6-7
+        Sr = S(:, l) ./ max(S_min(:, l), eps);
+        I  = double(Sr > delta);
+        p(:, l) = alpha_p * p(:, l-1) + (1 - alpha_p) * I;
+
+        % Time-varying smoothing factor + noise PSD update — Eq. 8-9
+        alpha_d_tilde  = alpha_d + (1 - alpha_d) * p(:, l);
+        lambda_d(:, l) = alpha_d_tilde .* lambda_d(:, l-1) + (1 - alpha_d_tilde) .* X_pow(:, l);
+    end
+
+    p_avg = mean(p, 1);
+end
+
+% -------------------------------------------------------------------------
 function VAD_sig = vad_to_signal(VAD, win_len, hop, out_len)
 % Expand per-frame VAD decisions to sample-level using overlap logic.
     T       = length(VAD);
@@ -299,6 +346,9 @@ function VAD_sig = vad_to_signal(VAD, win_len, hop, out_len)
     cnt     = max(cnt, 1);
     VAD_sig = VAD_sig ./ cnt >= 0.5;   % majority vote across overlapping frames
     VAD_sig = double(VAD_sig(1:min(out_len, end)));
+    if length(VAD_sig) < out_len
+        VAD_sig = [VAD_sig; zeros(out_len - length(VAD_sig), 1)];
+    end
 end
 
 % -------------------------------------------------------------------------
